@@ -67,6 +67,9 @@ type Session struct {
 
 	closeMu  sync.RWMutex
 	isClosed bool
+
+	connectedMu   sync.RWMutex
+	everConnected bool
 }
 
 var queryPool = &sync.Pool{
@@ -134,7 +137,8 @@ func NewSession(cfg ClusterConfig) (*Session, error) {
 	}
 	s.connCfg = connCfg
 
-	if err := s.init(); err != nil {
+	err := s.initConnection()
+	if err != nil && !cfg.AllowLazyConnect {
 		s.Close()
 		if err == ErrNoConnectionsStarted {
 			//This error used to be generated inside NewSession & returned directly
@@ -149,7 +153,7 @@ func NewSession(cfg ClusterConfig) (*Session, error) {
 	return s, nil
 }
 
-func (s *Session) init() error {
+func (s *Session) initConnection() error {
 	hosts, err := addrsToHosts(s.cfg.Hosts, s.cfg.Port)
 	if err != nil {
 		return err
@@ -218,6 +222,9 @@ func (s *Session) init() error {
 		return ErrNoConnectionsStarted
 	}
 
+	s.connectedMu.Lock()
+	s.everConnected = true
+	s.connectedMu.Unlock()
 	return nil
 }
 
@@ -340,6 +347,11 @@ func (s *Session) Close() {
 	}
 	s.isClosed = true
 
+	if !s.EverConnected() {
+		//Never connected, so nothing to close
+		return
+	}
+
 	if s.pool != nil {
 		s.pool.Close()
 	}
@@ -372,10 +384,24 @@ func (s *Session) Closed() bool {
 	return closed
 }
 
+func (s *Session) EverConnected() bool {
+	s.connectedMu.RLock()
+	everConnected := s.everConnected
+	s.connectedMu.RUnlock()
+	return everConnected
+}
+
 func (s *Session) executeQuery(qry *Query) *Iter {
 	// fail fast
 	if s.Closed() {
 		return &Iter{err: ErrSessionClosed}
+	}
+
+	if !s.EverConnected() {
+		err := s.initConnection()
+		if err != nil {
+			return &Iter{err: ErrNeverConnected}
+		}
 	}
 
 	iter, err := s.executor.executeQuery(qry)
@@ -394,6 +420,10 @@ func (s *Session) KeyspaceMetadata(keyspace string) (*KeyspaceMetadata, error) {
 	// fail fast
 	if s.Closed() {
 		return nil, ErrSessionClosed
+	}
+
+	if !s.EverConnected() {
+		return nil, ErrNeverConnected
 	}
 
 	if keyspace == "" {
@@ -574,6 +604,13 @@ func (s *Session) executeBatch(batch *Batch) *Iter {
 		return &Iter{err: ErrSessionClosed}
 	}
 
+	if !s.EverConnected() {
+		err := s.initConnection()
+		if err != nil {
+			return &Iter{err: ErrNeverConnected}
+		}
+	}
+
 	// Prevent the execution of the batch if greater than the limit
 	// Currently batches have a limit of 65536 queries.
 	// https://datastax-oss.atlassian.net/browse/JAVA-229
@@ -637,6 +674,7 @@ func (s *Session) MapExecuteBatchCAS(batch *Batch, dest map[string]interface{}) 
 	return applied, iter, iter.err
 }
 
+//Establish a new connection this session can use (like for connection pools)
 func (s *Session) connect(host *HostInfo, errorHandler ConnErrorHandler) (*Conn, error) {
 	return Connect(host, s.connCfg, errorHandler, s)
 }
@@ -1576,6 +1614,7 @@ var (
 	ErrTooManyStmts         = errors.New("too many statements")
 	ErrUseStmt              = errors.New("use statements aren't supported. Please see https://github.com/gocql/gocql for explanation.")
 	ErrSessionClosed        = errors.New("session has been closed")
+	ErrNeverConnected       = errors.New("session has not been able to ever connect")
 	ErrNoConnections        = errors.New("gocql: no hosts available in the pool")
 	ErrNoKeyspace           = errors.New("no keyspace provided")
 	ErrKeyspaceDoesNotExist = errors.New("keyspace does not exist")

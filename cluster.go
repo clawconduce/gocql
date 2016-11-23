@@ -96,6 +96,12 @@ type ClusterConfig struct {
 	// such host filtering and token aware query routing will not be available.
 	DisableInitialHostLookup bool
 
+	// This will allow the connection to fail when creating a new Session.  This may
+	// be useful for situations where a process could (re)start while the CQL server
+	// is down.  If not connected, the client will attempt to connect if a connection
+	// is needed, and if that attempt fails, an error is returned.
+	AllowLazyConnect bool
+
 	// Configure events the driver will register for
 	Events struct {
 		// disable registering for status events (node up/down)
